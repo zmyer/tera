@@ -50,8 +50,7 @@ public:
             : row_done_counter(c), request(req), response(resp), done(d), timer(t) {}
     };
 
-    TabletNodeImpl(const TabletNodeInfo& tabletnode_info,
-                   TabletManager* tablet_manager = NULL);
+    TabletNodeImpl();
     ~TabletNodeImpl();
 
     bool Init();
@@ -199,9 +198,9 @@ private:
 
     scoped_ptr<ThreadPool> thread_pool_;
 
-    RpcCompactor<MergeTabletResponse> merge_rpc_compactor_;
     leveldb::Logger* ldb_logger_;
     leveldb::Cache* ldb_block_cache_;
+    leveldb::Cache* m_memory_cache;
     leveldb::TableCache* ldb_table_cache_;
 };
 

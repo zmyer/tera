@@ -14,6 +14,7 @@ RowMutationImpl::RowMutationImpl(TableImpl* table, const std::string& row_key)
       table_(table),
       row_key_(row_key),
       callback_(NULL),
+      user_context_(NULL),
       timeout_ms_(0),
       retry_times_(0),
       finish_(false),
@@ -258,7 +259,11 @@ void RowMutationImpl::DeleteFamily(const std::string& family,
 void RowMutationImpl::DeleteRow(int64_t timestamp) {
     RowMutation::Mutation& mutation = AddMutation();
     mutation.type = RowMutation::kDeleteRow;
-    mutation.timestamp = timestamp;
+    if (timestamp == -1) {
+        mutation.timestamp = kLatestTimestamp;
+    } else {
+        mutation.timestamp = timestamp;
+    }
 }
 
 /// 修改锁住的行, 必须提供行锁

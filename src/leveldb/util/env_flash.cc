@@ -423,7 +423,7 @@ Status FlashEnv::NewWritableFile(const std::string& fname,
 }
 
 // FileExists
-bool FlashEnv::FileExists(const std::string& fname)
+Status FlashEnv::FileExists(const std::string& fname)
 {
     return dfs_env_->FileExists(fname);
 }
@@ -494,7 +494,7 @@ void FlashEnv::SetFlashPath(const std::string& path, bool vanish_allowed) {
             flash_paths_.push_back(std::string(str + beg, i - beg));
             beg = i +1;
             if (!vanish_allowed
-                && !Env::Default()->FileExists(flash_paths_.back())
+                && !Env::Default()->FileExists(flash_paths_.back()).ok()
                 && !Env::Default()->CreateDir(flash_paths_.back()).ok()) {
                 Log("[env_flash] cannot access cache dir: %s\n",
                     flash_paths_.back().c_str());
@@ -587,13 +587,13 @@ void FlashEnv::UpdateFlashFile(const std::string& fname, uint64_t fsize) {
             copy_status.ToString().c_str(), task.id, task.priority,
             local_fname.c_str(), update_flash_threads_.GetPendingTaskNum());
 
-        UpdateFlashFileParam* param = new UpdateFlashFileParam;
-        param->flash_env = this;
-        param->fname = fname;
-        param->fsize = fsize;
-
         task.priority >>= 1; // cut down priority to half
         if (task.priority > 0) {
+            UpdateFlashFileParam* param = new UpdateFlashFileParam;
+            param->flash_env = this;
+            param->fname = fname;
+            param->fsize = fsize;
+
             task.id = update_flash_threads_.Schedule(UpdateFlashFileFunc, param, (double)task.priority,
                                                      update_flash_retry_interval_millis_);
             Log("[env_flash] schedule copy to local after %ld ms, id: %ld, prio: %ld, file: %s\n",

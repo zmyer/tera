@@ -263,9 +263,11 @@ void print_size_and_count(int64_t size, int64_t count) {
         dsize /= 1024;
         unit_index++;
     }
+    std::ios::fmtflags cout_flag(std::cout.flags());
     std::cout << std::fixed << std::setprecision(3) << dsize
         << unit[unit_index];
     std::cout << "(" << count << ")";
+    std::cout.flags(cout_flag);
 }
 
 void print_statistic(Statistic* statistic) {
@@ -421,6 +423,7 @@ void print_summary(Statistic* marker, double duration) {
                          &success_count, &success_size);
 
     print_opt(marker);
+    std::streamsize precision = std::cout.precision();
     std::cout.precision(3);
     std::cout << " Summary: " << std::fixed << duration << " s\n"
         << "    total: " << finish_size << " bytes "
@@ -430,6 +433,7 @@ void print_summary(Statistic* marker, double duration) {
                          << success_count << " records "
                          << (double)success_size / 1048576 / duration << " MB/s"
         << std::endl;
+    std::cout.precision(precision);
 }
 
 void print_summary_proc(Adapter* adapter, double duration) {

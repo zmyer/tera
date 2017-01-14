@@ -210,7 +210,9 @@ private:
         tera::AutoCounter ac(&dfs_info_hang_counter, "GetFileSize", filename_.c_str());
         dfs_info_counter.Inc();
         uint64_t size = 0;
-        fs_->GetFileSize(filename_, &size);
+        if (fs_->GetFileSize(filename_, &size) != 0) {
+            return -1;
+        }
         return size;
     }
 };
@@ -282,7 +284,7 @@ public:
         Status s;
         tera::Counter dfs_sync_counter;
         uint64_t t = EnvDfs()->NowMicros();
-        if (file_->Sync() == -1) {
+        if (file_->Sync() != 0) {
             Log("[env_dfs] dfs sync fail: %s\n", filename_.c_str());
             s = IOError(filename_, errno);
         }
@@ -355,12 +357,26 @@ Status DfsEnv::NewWritableFile(const std::string& fname,
     return Status::OK();
 }
 
-// FileExists
-bool DfsEnv::FileExists(const std::string& fname)
+// returns:
+//   ok: exists
+//   nofound: not found
+//   timeout: timeout, unknown, should retry
+//   ioerror: io error
+Status DfsEnv::FileExists(const std::string& fname)
 {
     tera::AutoCounter ac(&dfs_exists_hang_counter, "Exists", fname.c_str());
     dfs_exists_counter.Inc();
-    return (0 == dfs_->Exists(fname));
+    int32_t retval = dfs_->Exists(fname);
+    if (retval == 0) {
+        return Status::OK();
+    } else if (errno == ENOENT) {
+        return Status::NotFound("filestatus", fname);
+    } else if (errno == ETIMEDOUT)  {
+        Log("[env_dfs] exists timeout: %s\n", fname.c_str());
+        return Status::TimeOut("filestatus", fname);
+    } else {
+        return Status::IOError(fname);
+    }
 }
 
 Status DfsEnv::CopyFile(const std::string& from, const std::string& to) {

@@ -23,6 +23,7 @@
 #include "leveldb/env_dfs.h"
 #include "leveldb/env_flash.h"
 #include "leveldb/env_inmem.h"
+#include "leveldb/env_mock.h"
 #include "leveldb/filter_policy.h"
 #include "types.h"
 #include "utils/counter.h"
@@ -58,7 +59,7 @@ DECLARE_bool(tera_tabletnode_cache_enabled);
 DECLARE_int32(tera_leveldb_env_local_seek_latency);
 DECLARE_int32(tera_leveldb_env_dfs_seek_latency);
 DECLARE_int32(tera_memenv_table_cache_size);
-DECLARE_int32(tera_memenv_block_cache_size);
+DECLARE_bool(tera_use_flash_for_memenv);
 
 DECLARE_bool(tera_tablet_use_memtable_on_leveldb);
 DECLARE_int64(tera_tablet_memtable_ldb_write_buffer_size);
@@ -71,14 +72,16 @@ namespace io {
 
 TabletIO::TabletIO(const std::string& key_start, const std::string& key_end)
     : async_writer_(NULL),
+      scan_context_manager_(NULL),
       start_key_(key_start),
       end_key_(key_end),
       compact_status_(kTableNotCompact),
       status_(kNotInit),
       ref_count_(1), db_ref_count_(0), db_(NULL),
-      mem_store_activated_(false),
+      m_memory_cache(NULL),
       kv_only_(false),
-      key_operator_(NULL) {
+      key_operator_(NULL),
+      mock_env_(NULL) {
 }
 
 TabletIO::~TabletIO() {
@@ -90,6 +93,10 @@ TabletIO::~TabletIO() {
         }
         delete db_;
     }
+}
+
+void TabletIO::SetMockEnv(leveldb::Env* e) {
+    mock_env_ = e;
 }
 
 std::string TabletIO::GetTableName() const {
@@ -138,6 +145,10 @@ RawKey TabletIO::RawKeyType() const {
 
 TabletIO::StatCounter& TabletIO::GetCounter() {
     return counter_;
+}
+
+void TabletIO::SetMemoryCache(leveldb::Cache* cache) {
+    m_memory_cache = cache;
 }
 
 bool TabletIO::Load(const TableSchema& schema,
@@ -336,10 +347,6 @@ bool TabletIO::Unload(StatusCode* status) {
     db_ = NULL;
 
     delete ldb_options_.filter_policy;
-    if (mem_store_activated_) {
-        delete ldb_options_.block_cache;
-        mem_store_activated_ = false;
-    }
     TearDownOptionsForLG();
     LOG(INFO) << "[Unload] done " << tablet_path_;
 
@@ -367,41 +374,34 @@ bool TabletIO::FindAverageKey(const std::string& start, const std::string& end,
     max_len++;  // max_len should be >0
     s.resize(max_len, '\x00');
     e.resize(max_len, '\x00');
-
     if (s == e) {
         // find failed, e.g. s == "a" && e == "a\0"
         return false;
     }
 
-    std::string ave;
+    // algorithm: use big number ADD and division
+    unsigned int carry[max_len + 1];
+    unsigned int sum[max_len];
+    carry[max_len] = 0;
+    for (int i = max_len - 1; i >= 0; --i) {
+        sum[i] = (unsigned char)s[i] + (unsigned char)e[i] + carry[i + 1];
+        carry[i] = sum[i] / 256;
+        sum[i] %= 256;
+    }
+    memset((char*)carry + sizeof(int), '\0', (max_len) * sizeof(int));
     for (int i = 0; i < max_len; ++i) {
-        if (s[i] == e[i]) {
-            ave.append(1, s[i]);
-            continue;
-        } else if ((uint32_t)(unsigned char)s[i] + 1 < (uint32_t)(unsigned char)e[i]) {
-            // find success
-            char c = (char)(((uint32_t)(unsigned char)s[i]
-                             + (uint32_t)(unsigned char)(e[i])) / 2);
-            ave.append(1, c);
-            break;
-        } else {
-            // find success
-            CHECK((uint32_t)(unsigned char)s[i] == (uint32_t)(unsigned char)e[i] - 1
-                  && i < max_len - 1);
-            uint32_t c_int = ((uint32_t)(unsigned char)s[i + 1]
-                             + (uint32_t)(unsigned char)e[i + 1] + 0x100) / 2;
-            if (c_int < 0x100) {
-                ave.append(1, s[i]);
-            } else {
-                ave.append(1, e[i]);
-            }
-            char c = (char)(c_int);
-            ave.append(1, c);
+        carry[i + 1] = (sum[i] + carry[i] * 256) % 2;
+        sum[i] = (sum[i] + carry[i] * 256) / 2;
+    }
+    std::string ave_key;
+    for (int i = 0; i < max_len; ++i) {
+        ave_key.append(1, char(sum[i]));
+        if (ave_key > start && (end == "" || ave_key < end)) {
             break;
         }
     }
-    CHECK(ave > start && (end == "" || ave < end));
-    *res = ave;
+    CHECK(ave_key > start && (end == "" || ave_key < end));
+    *res = ave_key;
     return true;
 }
 
@@ -994,7 +994,7 @@ inline bool TabletIO::LowLevelScan(const std::string& start_tera_key,
     }
 
     // check if scan finished
-    SetStatusCode(kTableOk, status);
+    SetStatusCode(kTabletNodeOk, status);
     if ((buffer_size < scan_options.max_size) &&
         (number_limit < scan_options.number_limit) &&
         (now_time <= time_out)) {
@@ -1022,7 +1022,7 @@ bool TabletIO::LowLevelSeek(const std::string& row_key,
                             RowResult* value_list,
                             StatusCode* status) {
     StatusCode s;
-    SetStatusCode(kTableOk, &s);
+    SetStatusCode(kTabletNodeOk, &s);
     value_list->clear_key_values();
 
     // create tera iterator
@@ -1065,7 +1065,7 @@ bool TabletIO::LowLevelSeek(const std::string& row_key,
     } else {
         SetStatusCode(kKeyNotExist, &s);
     }
-    if (s != kTableOk) {
+    if (s != kTabletNodeOk) {
         delete compact_strategy;
         delete it_data;
         SetStatusCode(s, status);
@@ -1170,7 +1170,7 @@ bool TabletIO::LowLevelSeek(const std::string& row_key,
     delete it_data;
 
     SetStatusCode(s, status);
-    if (s == kTableOk) {
+    if (s == kTabletNodeOk) {
         return true;
     } else {
         return false;
@@ -1308,7 +1308,7 @@ bool TabletIO::WriteBatch(leveldb::WriteBatch* batch, bool disable_wal, bool syn
         SetStatusCode(kIOError, status);
         return false;
     }
-    SetStatusCode(kTableOk, status);
+    SetStatusCode(kTabletNodeOk, status);
     return true;
 }
 
@@ -1662,22 +1662,28 @@ void TabletIO::SetupOptionsForLG() {
 
         leveldb::LG_info* lg_info = new leveldb::LG_info(lg_schema.id());
 
-        if (store == MemoryStore) {
-            ldb_options_.env = lg_info->env = LeveldbMemEnv();
-            ldb_options_.seek_latency = 0;
-            ldb_options_.block_cache =
-                leveldb::NewLRUCache(FLAGS_tera_memenv_block_cache_size * 1024 * 1024);
-            mem_store_activated_ = true;
+        if (mock_env_ != NULL) {
+            // for testing
+            LOG(INFO) << "mock env used";
+            ldb_options_.env = LeveldbMockEnv();
+        } else if (store == MemoryStore) {
+            if (FLAGS_tera_use_flash_for_memenv) {
+                lg_info->env = LeveldbFlashEnv();
+            } else {
+                lg_info->env = LeveldbMemEnv();
+            }
+            lg_info->seek_latency = 0;
+            lg_info->block_cache = m_memory_cache;
         } else if (store == FlashStore) {
             if (!FLAGS_tera_tabletnode_cache_enabled) {
-                ldb_options_.env = lg_info->env = LeveldbFlashEnv();
+                lg_info->env = LeveldbFlashEnv();
             } else {
                 LOG(INFO) << "activate block-level Cache store";
-                ldb_options_.env = lg_info->env = leveldb::EnvThreeLevelCache();
+                lg_info->env = leveldb::EnvThreeLevelCache();
             }
-            ldb_options_.seek_latency = FLAGS_tera_leveldb_env_local_seek_latency;
+            lg_info->seek_latency = FLAGS_tera_leveldb_env_local_seek_latency;
         } else {
-            ldb_options_.env = lg_info->env = LeveldbBaseEnv();
+            lg_info->env = LeveldbBaseEnv();
             ldb_options_.seek_latency = FLAGS_tera_leveldb_env_dfs_seek_latency;
         }
 
@@ -1697,7 +1703,6 @@ void TabletIO::SetupOptionsForLG() {
                 << ", block_size:"  << lg_info->memtable_ldb_block_size;
         }
         lg_info->sst_size = lg_schema.sst_size();
-        ldb_options_.sst_size = lg_schema.sst_size();
         // FLAGS_tera_tablet_write_buffer_size is the max buffer size
         int64_t max_size = FLAGS_tera_tablet_max_write_buffer_size * 1024 * 1024;
         if (lg_schema.sst_size() * 4 < max_size) {

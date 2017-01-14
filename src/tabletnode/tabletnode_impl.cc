@@ -65,6 +65,7 @@ DECLARE_int32(tera_tabletnode_compact_thread_num);
 DECLARE_string(tera_tabletnode_path_prefix);
 
 // cache-related
+DECLARE_int32(tera_memenv_block_cache_size);
 DECLARE_bool(tera_tabletnode_cache_enabled);
 DECLARE_string(tera_tabletnode_cache_paths);
 DECLARE_int32(tera_tabletnode_cache_block_size);
@@ -94,19 +95,18 @@ static const int GC_LOG_LEVEL = FLAGS_tera_tabletnode_gc_log_level;
 namespace tera {
 namespace tabletnode {
 
-TabletNodeImpl::TabletNodeImpl(const TabletNodeInfo& tabletnode_info,
-                               TabletManager* tablet_manager)
+TabletNodeImpl::TabletNodeImpl()
     : status_(kNotInited),
-      tablet_manager_(tablet_manager),
+      tablet_manager_(new TabletManager()),
       zk_adapter_(NULL),
       release_cache_timer_id_(kInvalidTimerId),
-      sysinfo_(tabletnode_info),
       thread_pool_(new ThreadPool(FLAGS_tera_tabletnode_impl_thread_max_num)) {
     if (FLAGS_tera_local_addr == "") {
         local_addr_ = utils::GetLocalHostName()+ ":" + FLAGS_tera_tabletnode_port;
     } else {
         local_addr_ = FLAGS_tera_local_addr + ":" + FLAGS_tera_tabletnode_port;
     }
+    sysinfo_.SetServerAddr(local_addr_);
     TabletNodeClient::SetThreadPool(thread_pool_.get());
 
     leveldb::Env::Default()->SetBackgroundThreads(FLAGS_tera_tabletnode_compact_thread_num);
@@ -118,6 +118,8 @@ TabletNodeImpl::TabletNodeImpl(const TabletNodeInfo& tabletnode_info,
 
     ldb_block_cache_ =
         leveldb::NewLRUCache(FLAGS_tera_tabletnode_block_cache_size * 1024UL * 1024);
+    m_memory_cache =
+        leveldb::NewLRUCache(FLAGS_tera_memenv_block_cache_size * 1024UL * 1024);
     ldb_table_cache_ =
         new leveldb::TableCache(FLAGS_tera_tabletnode_table_cache_size * 1024UL * 1024);
     if (!s.ok()) {
@@ -129,10 +131,6 @@ TabletNodeImpl::TabletNodeImpl(const TabletNodeInfo& tabletnode_info,
     }
 
     InitCacheSystem();
-
-    if (tablet_manager_.get() == NULL) {
-        tablet_manager_.reset(new TabletManager());
-    }
 
     if (FLAGS_tera_tabletnode_tcm_cache_release_enabled) {
         LOG(INFO) << "enable tcmalloc cache release timer";
@@ -205,7 +203,7 @@ bool TabletNodeImpl::Exit() {
     std::vector<TabletMeta*>::iterator it = tablet_meta_list.begin();
     for (; it != tablet_meta_list.end(); ++it) {
         TabletMeta*& tablet_meta = *it;
-        StatusCode status = kTableOk;
+        StatusCode status = kTabletNodeOk;
         bool ret = UnloadTablet(tablet_meta->table_name(),
             tablet_meta->key_range().key_start(),
             tablet_meta->key_range().key_end(), &status);
@@ -221,7 +219,8 @@ void TabletNodeImpl::LoadTablet(const LoadTabletRequest* request,
     response->set_sequence_id(request->sequence_id());
     std::string sid = GetSessionId();
     if (!request->has_session_id() ||
-        request->session_id() != sid) {
+        (sid.size() == 0) ||
+        request->session_id().compare(0, sid.size(), sid) != 0) {
         LOG(WARNING) << "load session id not match: tablet " << request->path()
            << ", session_id " << request->session_id() << ", ts_id " << sid;
         response->set_status(kIllegalAccess);
@@ -281,25 +280,29 @@ void TabletNodeImpl::LoadTablet(const LoadTabletRequest* request,
             << StatusCodeToString(status);
         response->set_status((StatusCode)tablet_io->GetStatus());
         tablet_io->DecRef();
-    } else if (!tablet_io->Load(schema, request->path(), parent_tablets,
-                                snapshots, rollbacks, ldb_logger_,
-                                ldb_block_cache_, ldb_table_cache_, &status)) {
-        tablet_io->DecRef();
-        LOG(ERROR) << "fail to load tablet: " << request->path()
-            << " [" << DebugString(key_start) << ", "
-            << DebugString(key_end) << "], status: "
-            << StatusCodeToString(status);
-        if (!tablet_manager_->RemoveTablet(request->tablet_name(), key_start,
-                                            key_end, &status)) {
-            LOG(ERROR) << "fail to remove tablet: " << request->path()
+    } else {
+        ///TODO: User per user memery_cache according to user quota.
+        tablet_io->SetMemoryCache(m_memory_cache);
+        if (!tablet_io->Load(schema, request->path(), parent_tablets,
+                             snapshots, rollbacks, ldb_logger_,
+                             ldb_block_cache_, ldb_table_cache_, &status)) {
+            tablet_io->DecRef();
+            LOG(ERROR) << "fail to load tablet: " << request->path()
                 << " [" << DebugString(key_start) << ", "
                 << DebugString(key_end) << "], status: "
                 << StatusCodeToString(status);
+            if (!tablet_manager_->RemoveTablet(request->tablet_name(), key_start,
+                                               key_end, &status)) {
+                LOG(ERROR) << "fail to remove tablet: " << request->path()
+                    << " [" << DebugString(key_start) << ", "
+                    << DebugString(key_end) << "], status: "
+                    << StatusCodeToString(status);
+            }
+            response->set_status(kIOError);
+        } else {
+            tablet_io->DecRef();
+            response->set_status(kTabletNodeOk);
         }
-        response->set_status(kIOError);
-    } else {
-        tablet_io->DecRef();
-        response->set_status(kTabletNodeOk);
     }
 
     LOG(INFO) << "load tablet: " << request->path() << " ["
@@ -1221,7 +1224,7 @@ void TabletNodeImpl::EnableReleaseMallocCacheTimer(int32_t expand_factor) {
     assert(release_cache_timer_id_ == kInvalidTimerId);
     ThreadPool::Task task =
         boost::bind(&TabletNodeImpl::ReleaseMallocCache, this);
-    int64_t timeout_period = expand_factor * 1000 *
+    int64_t timeout_period = expand_factor * 1000LL *
         FLAGS_tera_tabletnode_tcm_cache_release_period;
     release_cache_timer_id_ = thread_pool_->DelayTask(timeout_period, task);
 }

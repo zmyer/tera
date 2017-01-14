@@ -229,6 +229,8 @@ const char* builtin_cmd_list[] = {
     "tablet",
     "tablet <operation> <params>                                          \n\
             move    <tablet_path> <target_addr>                           \n\
+            reload  <tablet_path>                                         \n\
+                    force to unload and load on the same ts               \n\
             compact <tablet_path>                                         \n\
             split   <tablet_path>                                         \n\
             merge   <tablet_path>                                         \n\
@@ -253,13 +255,20 @@ const char* builtin_cmd_list[] = {
                 find the address of master",
 
     "findts",
-    "findts <tablename> <rowkey>                                          \n\
-            find the specify tabletnode serving 'rowkey'.",
+    "findts <tablename> [rowkey]                                          \n\
+            find the specify tabletnode serving 'rowkey'.                 \n\
+            if 'rowkey' is omited, read from stdin with one rowkey per line.",
 
     "reload",
     "reload config hostname:port                                          \n\
             notify master | ts reload flag file                           \n\
             *** at your own risk ***",
+
+    "kick",
+    "kick hostname:port                                                   \n\
+          ask master to kick a tabletserver                               \n\
+          *** at your own risk ***",
+
 
     "findtablet",
     "findtablet <tablename> <rowkey-prefix>                               \n\
@@ -2142,6 +2151,23 @@ int32_t CookieOp(int32_t argc, char** argv) {
     return -1;
 }
 
+// e.g. ./teracli kick <hostname>:<port>
+int32_t KickTabletServerOp(Client* client, int32_t argc, char** argv, ErrorCode* err) {
+    if ((argc != 3)) {
+        PrintCmdHelpInfo(argv[1]);
+        return -1;
+    }
+    std::string addr(argv[2]);
+    std::vector<std::string> arg_list;
+    arg_list.push_back(addr);
+    if (!client->CmdCtrl("kick", arg_list, NULL, NULL, err)) {
+        LOG(ERROR) << "fail to kick tabletserver: " << addr;
+        return -1;
+    }
+    std::cout << "master will kick: " << addr << std::endl;
+    return 0;
+}
+
 int32_t ReloadConfigOp(Client* client, int32_t argc, char** argv, ErrorCode* err) {
     if ((argc != 4) || (std::string(argv[2]) != "config")) {
         PrintCmdHelpInfo(argv[1]);
@@ -2334,7 +2360,7 @@ int32_t ScanTabletOp(Client* client, int32_t argc, char** argv, ErrorCode* err) 
 }
 
 int32_t TabletOp(Client* client, int32_t argc, char** argv, ErrorCode* err) {
-    if (argc != 4 && argc != 5) {
+    if ((argc != 4) && (argc != 5)) {
         PrintCmdHelpInfo(argv[1]);
         return -1;
     }
@@ -2345,7 +2371,7 @@ int32_t TabletOp(Client* client, int32_t argc, char** argv, ErrorCode* err) {
         return CompactTabletOp(client, argc, argv, err);
     } else if (op == "scan" || op == "scanallv") {
         return ScanTabletOp(client, argc, argv, err);
-    } else if (op != "move" && op != "split" && op != "merge") {
+    } else if (op != "move" && op != "split" && op != "merge" && op != "reload") {
         PrintCmdHelpInfo(argv[1]);
         return -1;
     }
@@ -2501,7 +2527,7 @@ int32_t FindMasterOp(Client* client, int32_t argc, char** argv, ErrorCode* err) 
 }
 
 int32_t FindTsOp(Client* client, int32_t argc, char** argv, ErrorCode* err) {
-    if (argc != 4) {
+    if (argc != 3 && argc != 4) {
         PrintCmdHelpInfo(argv[1]);
         return -1;
     }
@@ -2514,15 +2540,31 @@ int32_t FindTsOp(Client* client, int32_t argc, char** argv, ErrorCode* err) {
         return -1;
     }
 
-    std::string rowkey = argv[3];
-    table->ScanMetaTable(rowkey, rowkey + '\0');
+    if (argc == 4) {
+        std::string rowkey = argv[3];
+        table->ScanMetaTable(rowkey, rowkey + '\0');
 
-    TabletMeta meta;
-    if (!table->GetTabletMetaForKey(rowkey, &meta)) {
-        LOG(ERROR) << "fail to get tablet meta for " << rowkey;
-        return -1;
+        TabletMeta meta;
+        if (!table->GetTabletMetaForKey(rowkey, &meta)) {
+            LOG(ERROR) << "fail to get tablet meta for " << rowkey;
+            return -1;
+        }
+        std::cout << meta.server_addr() << "\t" << meta.path() << std::endl;
+        return 0;
     }
-    std::cout << meta.server_addr() << "/" << meta.path() << std::endl;
+
+    table->ScanMetaTable("", "");
+    const int32_t buf_size = 1024 * 1024;
+    char rowkey[buf_size];
+    while (std::cin.getline(rowkey, buf_size)) {
+        TabletMeta meta;
+        if (!table->GetTabletMetaForKey(rowkey, &meta)) {
+            LOG(ERROR) << "fail to get tablet meta for " << rowkey;
+            continue;
+        }
+        std::cout << rowkey << "\t" << meta.server_addr() << "\t" << meta.path() << std::endl;
+    }
+
     return 0;
 }
 
@@ -3191,6 +3233,8 @@ int ExecuteCommand(Client* client, int argc, char* argv[]) {
         ret = UserOp(client, argc, argv, &error_code);
     } else if (cmd == "reload") {
         ret = ReloadConfigOp(client, argc, argv, &error_code);
+    } else if (cmd == "kick") {
+        ret = KickTabletServerOp(client, argc, argv, &error_code);
     } else if (cmd == "cookie") {
         ret = CookieOp(argc, argv);
     } else if (cmd == "snapshot") {
@@ -3246,16 +3290,16 @@ int main(int argc, char* argv[]) {
             }
             if (arg_list.size() == 2 &&
                 (strcmp(arg_list[1], "quit") == 0 || strcmp(arg_list[1], "exit") == 0)) {
-                delete[] line_copy;
-                delete[] line;
+                free(line_copy);
+                free(line);
                 break;
             }
             if (arg_list.size() > 1) {
                 add_history(line_copy);
                 ret = ExecuteCommand(client, arg_list.size(), &arg_list[0]);
             }
-            delete[] line_copy;
-            delete[] line;
+            free(line_copy);
+            free(line);
         }
     } else {
         ret = ExecuteCommand(client, argc, argv);

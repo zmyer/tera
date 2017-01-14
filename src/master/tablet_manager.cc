@@ -62,13 +62,15 @@ std::ostream& operator << (std::ostream& o, const TabletPtr& tablet) {
 Tablet::Tablet(const TabletMeta& meta)
     : meta_(meta),
       update_time_(common::timer::get_micros()),
-      load_time_(std::numeric_limits<int64_t>::max()) {}
+      load_time_(std::numeric_limits<int64_t>::max()),
+      merge_param_(NULL) {}
 
 Tablet::Tablet(const TabletMeta& meta, TablePtr table)
     : meta_(meta),
       table_(table),
       update_time_(common::timer::get_micros()),
-      load_time_(std::numeric_limits<int64_t>::max()) {}
+      load_time_(std::numeric_limits<int64_t>::max()),
+      merge_param_(NULL) {}
 
 Tablet::~Tablet() {
     table_.reset();
@@ -437,6 +439,16 @@ void Tablet::ToMetaTableKeyValue(std::string* packed_key,
     MakeMetaTableKeyValue(meta_, packed_key, packed_value);
 }
 
+void* Tablet::GetMergeParam() {
+    MutexLock lock(&mutex_);
+    return merge_param_;
+}
+
+void Tablet::SetMergeParam(void* merge_param) {
+    MutexLock lock(&mutex_);
+    merge_param_ = merge_param;
+}
+
 bool Tablet::CheckStatusSwitch(TabletStatus old_status,
                                TabletStatus new_status) {
     switch (old_status) {
@@ -513,7 +525,8 @@ bool Tablet::CheckStatusSwitch(TabletStatus old_status,
         }
         break;
     case kTableUnLoadFail:
-        if (new_status == kTableOffLine) {        // tabletnode is killed, ready to load
+        if (new_status == kTableOffLine           // tabletnode is killed, ready to load
+            || new_status == kTableOnMerge) {     // tabletnode is killed, ready to merge phase2
             return true;
         }
         break;
@@ -557,6 +570,8 @@ Table::Table(const std::string& table_name)
       create_time_((int64_t)time(NULL)),
       schema_is_syncing_(false),
       rangefragment_(NULL),
+      update_rpc_response_(NULL),
+      update_rpc_done_(NULL),
       old_schema_(NULL) {
 }
 
@@ -1122,13 +1137,13 @@ bool TabletManager::FindTablet(const std::string& table_name,
 
 void TabletManager::FindTablet(const std::string& server_addr,
                                std::vector<TabletPtr>* tablet_meta_list,
-                               bool all_tables) {
+                               bool need_disabled_tables) {
     mutex_.Lock();
     TableList::iterator it = all_tables_.begin();
     for (; it != all_tables_.end(); ++it) {
         Table& table = *it->second;
         table.mutex_.Lock();
-        if (table.status_ == kTableDisable && !all_tables) {
+        if (table.status_ == kTableDisable && !need_disabled_tables) {
             VLOG(10) << "FindTablet skip disable table: " << table.name_;
             table.mutex_.Unlock();
             continue;
@@ -1208,6 +1223,7 @@ int64_t TabletManager::SearchTable(std::vector<TabletPtr>* tablet_meta_list,
     TableList::iterator lower_it = all_tables_.lower_bound(start_table_name);
     TableList::iterator upper_it = all_tables_.upper_bound(prefix_table_name + "\xFF");
     if (upper_it == all_tables_.begin() || lower_it == all_tables_.end()) {
+        mutex_.Unlock();
         SetStatusCode(kTableNotFound, ret_status);
         return -1;
     }
@@ -1269,7 +1285,7 @@ bool TabletManager::ShowTable(std::vector<TablePtr>* table_meta_list,
             table_meta_list->push_back(table);
         }
         table_found_num++;
-        if (table_found_num == 1) {
+        if (it->first == start_tablet_key) {
             it2 = table->tablets_list_.lower_bound(start_tablet_key);
         } else {
             it2 = table->tablets_list_.begin();
@@ -1723,9 +1739,13 @@ bool TabletManager::RpcChannelHealth(int32_t err_code) {
 }
 
 void TabletManager::TryMajorCompact(Tablet* tablet) {
+    if (!tablet) {
+        VLOG(5) << "TryMajorCompact() tablet is NULL";
+        return;
+    }
     VLOG(5) << "TryMajorCompact() for " << tablet->meta_.path();
     MutexLock lock(&tablet->mutex_);
-    if (!tablet || tablet->meta_.compact_status() != kTableNotCompact) {
+    if (tablet->meta_.compact_status() != kTableNotCompact) {
         return;
     } else {
         tablet->meta_.set_compact_status(kTableOnCompact);
@@ -1768,7 +1788,7 @@ void TabletManager::MajorCompactCallback(Tablet* tb, int32_t retry,
             delete request;
             delete response;
         } else {
-            int64_t wait_time = FLAGS_tera_tabletnode_connect_retry_period
+            int32_t wait_time = FLAGS_tera_tabletnode_connect_retry_period
                 * (FLAGS_tera_master_impl_retry_times - retry);
             ThisThread::Sleep(wait_time);
             tabletnode::TabletNodeClient node_client(tb->meta_.server_addr());

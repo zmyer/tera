@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "sdk/client_impl.h"
+#include "version.h"
 
 #include <iostream>
 
@@ -45,6 +46,12 @@ DECLARE_bool(tera_online_schema_update_enabled);
 
 namespace tera {
 
+static pthread_once_t sdk_client_once_control = PTHREAD_ONCE_INIT;
+
+void LogSdkVersionInfo() {
+    LOG(INFO) << "\n" << SystemVersionInfo();
+}
+
 ClientImpl::ClientImpl(const std::string& user_identity,
                        const std::string& user_passcode)
     : thread_pool_(FLAGS_tera_sdk_thread_max_num),
@@ -56,6 +63,7 @@ ClientImpl::ClientImpl(const std::string& user_identity,
         FLAGS_tera_sdk_rpc_limit_enabled ? FLAGS_tera_sdk_rpc_limit_max_outflow : -1,
         FLAGS_tera_sdk_rpc_max_pending_buffer_size, FLAGS_tera_sdk_rpc_work_thread_num);
     cluster_ = sdk::NewClusterFinder();
+    pthread_once(&sdk_client_once_control, LogSdkVersionInfo);
 }
 
 ClientImpl::~ClientImpl() {
@@ -101,7 +109,7 @@ bool ClientImpl::CheckReturnValue(StatusCode status, std::string& reason, ErrorC
             reason = "table not found.";
             err->SetFailed(ErrorCode::kBadParam, reason);
             break;
-        case kTableDisable:
+        case kTableStatusDisable:
             reason = "table status: disable.";
             err->SetFailed(ErrorCode::kBadParam, reason);
             break;
@@ -442,10 +450,14 @@ bool ClientImpl::GetInternalTableName(const std::string& table_name, ErrorCode* 
     if (!meta_client.ScanTablet(&request, &response)
           || response.status() != kTabletNodeOk) {
         LOG(ERROR) << "fail to scan meta: " << StatusCodeToString(response.status());
-        err->SetFailed(ErrorCode::kSystem, "system error");
+        if (err != NULL) {
+            err->SetFailed(ErrorCode::kSystem, "system error");
+        }
         return false;
     }
-    err->SetFailed(ErrorCode::kOK);
+    if (err != NULL) {
+        err->SetFailed(ErrorCode::kOK);
+    }
     int32_t table_size = response.results().key_values_size();
     for (int32_t i = 0; i < table_size; i++) {
         const KeyValuePair& record = response.results().key_values(i);
@@ -507,7 +519,7 @@ Table* ClientImpl::OpenTable(const std::string& table_name,
 }
 
 TableImpl* ClientImpl::OpenTableInternal(const std::string& table_name,
-                                     ErrorCode* err) {
+                                         ErrorCode* err) {
     std::string internal_table_name;
     if (!GetInternalTableName(table_name, err, &internal_table_name)) {
         std::string reason = "fail to scan meta schema";
@@ -732,7 +744,7 @@ bool ClientImpl::DoShowTablesInfo(TableMetaList* table_list,
 
         if (master_client.ShowTables(&request, &response) &&
             response.status() == kMasterOk) {
-            if (tablet_list == NULL && response.all_brief()) {
+            if (response.all_brief()) {
                 // show all table brief
                 table_list->CopyFrom(response.table_meta_list());
                 return true;

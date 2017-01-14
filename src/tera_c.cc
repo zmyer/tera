@@ -12,6 +12,7 @@
 #include <map>
 
 #include "common/mutex.h"
+#include "common/timer.h"
 
 #include "tera.h"
 
@@ -33,22 +34,28 @@ struct tera_scan_descriptor_t { ScanDescriptor* rep; };
 struct tera_table_t           { Table*          rep; };
 
 static bool SaveError(char** errptr, const ErrorCode& s) {
-  assert(errptr != NULL);
-  if (s.GetType() == ErrorCode::kOK) {
-    return false;
-  } else if (*errptr == NULL) {
-    *errptr = strdup(s.GetReason().c_str());
-  } else {
-    free(*errptr);
-    *errptr = strdup(s.GetReason().c_str());
-  }
-  return true;
+    if (s.GetType() == ErrorCode::kOK) {
+        return false;
+    }
+    if (errptr == NULL) {
+        fprintf(stderr, "%s tera error: %s.\n",
+                common::timer::get_curtime_str().c_str(), s.GetReason().c_str());
+        return true;
+    }
+
+    if (*errptr == NULL) {
+        *errptr = strdup(s.GetReason().c_str());
+    } else {
+        free(*errptr);
+        *errptr = strdup(s.GetReason().c_str());
+    }
+    return true;
 }
 
 static char* CopyString(const std::string& str) {
-  char* result = reinterpret_cast<char*>(malloc(sizeof(char) * str.size()));
-  memcpy(result, str.data(), sizeof(char) * str.size());
-  return result;
+    char* result = reinterpret_cast<char*>(malloc(sizeof(char) * str.size()));
+    memcpy(result, str.data(), sizeof(char) * str.size());
+    return result;
 }
 
 //           <RowMutation*, <tera_row_mutation_t*, user_callback> >
@@ -188,6 +195,14 @@ void tera_table_apply_mutation(tera_table_t* table, tera_row_mutation_t* mutatio
     table->rep->ApplyMutation(mutation->rep);
 }
 
+void tera_table_apply_mutation_batch(tera_table_t* table, tera_row_mutation_t** mutation_batch, int64_t num) {
+    std::vector<RowMutation*> mutation_list;
+    for (int64_t i = 0; i < num; i++) {
+        mutation_list.push_back((*(mutation_batch + i))->rep);
+    }
+    table->rep->ApplyMutation(mutation_list);
+}
+
 tera_row_reader_t* tera_row_reader(tera_table_t* table, const char* row_key, uint64_t keylen) {
     tera_row_reader_t* result = new tera_row_reader_t;
     result->rep = table->rep->NewRowReader(std::string(row_key, keylen));
@@ -301,6 +316,14 @@ void tera_table_apply_reader(tera_table_t* table, tera_row_reader_t* reader) {
     table->rep->Get(reader->rep);
 }
 
+void tera_table_apply_reader_batch(tera_table_t* table, tera_row_reader_t** reader_batch, int64_t num) {
+    std::vector<RowReader*> reader_list;
+    for (int64_t i = 0; i < num; i++) {
+        reader_list.push_back((*(reader_batch + i))->rep);
+    }
+    table->rep->Get(reader_list);
+}
+
 bool tera_table_is_put_finished(tera_table_t* table) {
     return table->rep->IsPutFinished();
 }
@@ -324,6 +347,16 @@ void tera_row_mutation_put(tera_row_mutation_t* mu, const char* cf,
 void tera_row_mutation_delete_column(tera_row_mutation_t* mu, const char* cf,
                                      const char* qu, uint64_t qulen) {
     mu->rep->DeleteColumn(cf, std::string(qu, qulen));
+}
+
+void tera_row_mutation_delete_column_all_versions(tera_row_mutation_t* mu, const char* cf,
+                                                  const char* qu, uint64_t qulen) {
+    mu->rep->DeleteColumns(cf, std::string(qu, qulen));
+}
+
+void tera_row_mutation_delete_column_with_version(tera_row_mutation_t* mu, const char* cf,
+                                                  const char* qu, uint64_t qulen, int64_t timestamp) {
+    mu->rep->DeleteColumn(cf, std::string(qu, qulen), timestamp);
 }
 
 void tera_row_mutation_delete_row(tera_row_mutation_t* mu) {

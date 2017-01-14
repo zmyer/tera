@@ -488,7 +488,7 @@ public:
 
 private:
     Status OpenFile() {
-        fps_ = (FILE**)malloc(file_num_ * sizeof(FILE));
+        fps_ = (FILE**)malloc(file_num_ * sizeof(FILE*));
         for (uint32_t i = 0; i < file_num_; ++i) {
             std::string cache_file = CacheName(fname_, i);
             fps_[i] = fopen(cache_file.c_str(), "w+");
@@ -662,7 +662,7 @@ public:
 
 private:
     Status OpenFile() {
-        if (dfs_env_->FileExists(fname_hdfs_)) {
+        if (dfs_env_->FileExists(fname_hdfs_).ok()) {
             Status s = dfs_env_->GetFileSize(fname_hdfs_, &size_);
             if (!s.ok()) {
                 return Status::IOError("hdfs GetFileSize fail: ", fname_hdfs_);
@@ -716,7 +716,7 @@ private:
 
     Status LoadMissingFromRemote(uint32_t block_no, Slice* result, char* scratch) {
         Slice block_slice;
-        uint64_t offset = block_no * block_size_;
+        uint64_t offset = (uint64_t)block_no * block_size_;
         Status s = hdfs_file_->Read(offset, block_size_, &block_slice, scratch);
         if (s.ok()) {
             *result = Slice(scratch, block_size_);
@@ -820,7 +820,7 @@ public:
 
 private:
     Status OpenFile() {
-        if (dfs_env_->FileExists(fname_hdfs_)) {
+        if (dfs_env_->FileExists(fname_hdfs_).ok()) {
             Status s = dfs_env_->GetFileSize(fname_hdfs_, &size_);
             if (!s.ok()) {
                 return Status::IOError("hdfs GetFileSize fail: ", fname_hdfs_);
@@ -998,7 +998,7 @@ Status ThreeLevelCacheEnv::NewWritableFile(const std::string& fname,
     return Status::OK();
 }
 
-bool ThreeLevelCacheEnv::FileExists(const std::string& fname) {
+Status ThreeLevelCacheEnv::FileExists(const std::string& fname) {
     return dfs_env_->FileExists(fname);
 }
 

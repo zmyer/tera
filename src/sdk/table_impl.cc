@@ -65,6 +65,7 @@ TableImpl::TableImpl(const std::string& table_name,
                      common::ThreadPool* thread_pool,
                      sdk::ClusterFinder* cluster)
     : name_(table_name),
+      create_time_(0),
       last_sequence_id_(0),
       timeout_(FLAGS_tera_sdk_timeout),
       commit_size_(FLAGS_tera_sdk_batch_size),
@@ -79,6 +80,8 @@ TableImpl::TableImpl(const std::string& table_name,
       table_meta_cond_(&table_meta_mutex_),
       table_meta_updating_(false),
       task_pool_(thread_pool),
+      master_client_(NULL),
+      tabletnode_client_(NULL),
       thread_pool_(thread_pool),
       cluster_(cluster),
       cluster_private_(false),
@@ -1940,12 +1943,12 @@ void TableImpl::DoDumpCookie() {
 void TableImpl::DumpCookie() {
     DoDumpCookie();
     ThreadPool::Task task = boost::bind(&TableImpl::DumpCookie, this);
-    AddDelayTask(FLAGS_tera_sdk_cookie_update_interval * 1000, task);
+    AddDelayTask(FLAGS_tera_sdk_cookie_update_interval * 1000LL, task);
 }
 
 void TableImpl::EnableCookieUpdateTimer() {
     ThreadPool::Task task = boost::bind(&TableImpl::DumpCookie, this);
-    AddDelayTask(FLAGS_tera_sdk_cookie_update_interval * 1000, task);
+    AddDelayTask(FLAGS_tera_sdk_cookie_update_interval * 1000LL, task);
 }
 
 std::string TableImpl::GetCookieFileName(const std::string& tablename,
